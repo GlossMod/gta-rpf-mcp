@@ -159,3 +159,18 @@ def parse_job(value, job_id: str, parse_path):
     if len(refs) > MAX_JOB_FILES or sum(v["size"] for v in refs.values()) > MAX_JOB_INPUT_BYTES:
         raise invalid("The job exceeds the input budget.")
     return targets, list(refs.values()), None
+
+
+def job_operations(targets, inspect_dlc):
+    if inspect_dlc is not None:
+        return {"inspectDlc"}
+    operations = set()
+    for target in targets:
+        kinds = {entry["kind"] for entry in target["contributions"]}
+        if target["id"] == "update":
+            operations.update(kinds & {"dlc", "gameconfig"})
+        elif target["id"] == "gmm":
+            operations.update(kinds & {"vehicle", "ped"})
+        elif target["id"] == "menyoo":
+            operations.add("menyoo")
+    return operations

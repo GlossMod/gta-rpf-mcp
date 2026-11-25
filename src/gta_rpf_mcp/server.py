@@ -4,7 +4,9 @@ import json
 import sys
 
 from . import __version__
+from .archive_tools import ARCHIVE_TOOLS, call_archive_tool
 from .backend import status as backend_status
+from .job_info import describe_job
 from .prepare import prepare
 from .protocol import JOB_ID, Rejected, strict_json, token
 from .workspace import workspace_parent
@@ -12,15 +14,39 @@ from .workspace import workspace_parent
 _PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 _LINE = 1024 * 1024
 _EMPTY = {"type": "object", "properties": {}, "additionalProperties": False}
+_JOB_ID_SCHEMA = {
+    "type": "string", "pattern": "^[0-9a-f]{32}$", "minLength": 32, "maxLength": 32,
+    "description": "The jobId returned by AMM's native prepare_gta_rpf_job tool for this game.",
+}
+_JOB_SCHEMA = {**_EMPTY, "properties": {"jobId": _JOB_ID_SCHEMA}, "required": ["jobId"]}
+_READ_HINTS = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
+_ARCHIVE_TOOL_NAMES = {tool["name"] for tool in ARCHIVE_TOOLS}
+# The service is shared by both adapters. The staged manifest determines the edition.
+_JOB_TOOLS = {
+    "gta_rpf_prepare": (None, "Prepare any AMM archive job, including uninstall rebuilds and empty jobs."),
+    "gta_rpf_inspect_dlc": ("inspectDlc", "Legacy and Enhanced: read the staged DLC's setup2.xml and return its pack name."),
+    "gta_rpf_register_dlc": ("dlc", "Legacy and Enhanced: register a DLC in the staged update.rpf dlclist.xml."),
+    "gta_rpf_replace_gameconfig": ("gameconfig", "Legacy and Enhanced: replace gameconfig.xml in the staged update.rpf."),
+    "gta_rpf_build_vehicle_pack": ("vehicle", "Legacy only: build the staged GMM DLC with the job's vehicle models."),
+    "gta_rpf_build_ped_pack": ("ped", "Legacy only: build the staged GMM DLC with the job's Ped models and metadata."),
+    "gta_rpf_update_menyoo": ("menyoo", "Legacy only: rebuild the staged Menyoo vehicle list from the job's models."),
+}
 _TOOLS = [
-    {"name": "gta_rpf_prepare", "description": "Prepare one manager-created GTA V archive job; never apply it to a game.",
-     "inputSchema": {**_EMPTY, "properties": {"jobId": {"type": "string", "pattern": "^[0-9a-f]{32}$", "minLength": 32, "maxLength": 32}},
-                     "required": ["jobId"]},
-     "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False}},
+    {"name": name, "description": description + " Call once per AMM jobId. All targets in that job are staged together.",
+     "inputSchema": _JOB_SCHEMA,
+     "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False}}
+    for name, (_, description) in _JOB_TOOLS.items()
+] + [
     {"name": "gta_rpf_status", "description": "Report the bundled Python RPF7 backend and supported jobs for each GTA V edition.",
      "inputSchema": _EMPTY,
-     "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}},
-]
+     "annotations": _READ_HINTS},
+    {"name": "gta_rpf_describe_job",
+     "description": "Discover a staged job's edition, available preparation tools and manifest input paths for archive tools. Pages start at offset 0.",
+     "inputSchema": {**_JOB_SCHEMA, "properties": {"jobId": _JOB_ID_SCHEMA,
+                     "offset": {"type": "integer", "minimum": 0, "default": 0},
+                     "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 32}}},
+     "annotations": _READ_HINTS},
+] + ARCHIVE_TOOLS
 
 
 class RpcError(Exception):
@@ -49,9 +75,19 @@ class Server:
         try:
             if name == "gta_rpf_status" and not args:
                 value = backend_status()
-            elif name == "gta_rpf_prepare" and args.keys() == {"jobId"}:
+            elif name in _ARCHIVE_TOOL_NAMES:
+                value = call_archive_tool(name, args)
+            elif name == "gta_rpf_describe_job" and "jobId" in args and not args.keys() - {"jobId", "offset", "limit"}:
                 job_id = token(args["jobId"], JOB_ID, "job ID")
-                value = prepare(workspace_parent(), job_id)
+                offset, limit = args.get("offset", 0), args.get("limit", 32)
+                if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 100:
+                    raise RpcError(-32602, "Invalid page bounds")
+                value, operations = describe_job(workspace_parent(), job_id, offset, limit)
+                value["preparationTools"] = [tool for tool, (op, _) in _JOB_TOOLS.items()
+                                             if op is None or op in operations]
+            elif name in _JOB_TOOLS and args.keys() == {"jobId"}:
+                job_id = token(args["jobId"], JOB_ID, "job ID")
+                value = prepare(workspace_parent(), job_id, operation=_JOB_TOOLS[name][0])
             else:
                 raise RpcError(-32602, "Unknown tool or invalid tool arguments")
         except Rejected as exc:

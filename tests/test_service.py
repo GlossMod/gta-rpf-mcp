@@ -10,13 +10,14 @@ import struct
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 import xml.etree.ElementTree as ET
 
 from gta_rpf_mcp import __version__, backend
 from gta_rpf_mcp.gta_xml import DLCLIST, GAMECONFIG, PED_META, dlclist, parse_xml, vehicle_models
 from gta_rpf_mcp.prepare import prepare
 from gta_rpf_mcp.protocol import Rejected, strict_json
-from gta_rpf_mcp.server import run
+from gta_rpf_mcp.server import Server, run
 from gta_rpf_mcp.workspace import split_relative
 
 HERE = Path(__file__).resolve().parents[1]
@@ -170,6 +171,29 @@ class JobTests(unittest.TestCase):
         self.assertEqual(names, [{"modelName": "Custom", "customName": "Keep me"}, {"modelName": "dlccar", "customName": "dlccar"}])
         self.assertEqual(fixture_entries(self.job / base["path"])[DLCLIST], OLD_LIST)
 
+    def test_describe_job_pages_manifest_inputs_without_consuming_job(self):
+        base = self.baseline()
+        dlc = self.dlc("Example")
+        self.input(target("update", base, dlc), edition="enhanced")
+        server = Server()
+        server.version = "2025-06-18"
+        with patch("gta_rpf_mcp.server.workspace_parent", return_value=self.jobs):
+            def describe(offset):
+                return server.tool("gta_rpf_describe_job", {"jobId": self.id, "offset": offset,
+                                                            "limit": 1})["structuredContent"]
+            first, second = describe(0), describe(1)
+        self.assertEqual(first["edition"], "enhanced")
+        self.assertCountEqual(first["preparationTools"], ["gta_rpf_prepare", "gta_rpf_register_dlc"])
+        self.assertEqual(first["total"], 2)
+        self.assertEqual(first["inputs"][0]["path"], base["path"])
+        self.assertEqual(first["inputs"][0]["archive"], {"path": base["path"], "name": "update.rpf"})
+        self.assertEqual(first["nextOffset"], 1)
+        self.assertEqual(second["inputs"][0]["path"], dlc["source"]["path"])
+        self.assertEqual(second["inputs"][0]["archive"], {"path": dlc["source"]["path"], "name": "dlc.rpf"})
+        self.assertIsNone(second["nextOffset"])
+        self.assertFalse((self.job / ".prepare.lock").exists())
+        self.assertEqual(prepare(self.jobs, self.id, FakeBridge, operation="dlc")["status"], "ok")
+
     def test_inspect_without_output_and_reserved_name_rejection(self):
         r = self.work(inspectDlc=self.dlc("PackUP")["source"])
         self.assertEqual(r, {"schemaVersion": 1, "jobId": self.id, "status": "inspected", "packName": "packup"})
@@ -302,7 +326,13 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual([r["id"] for r in responses], [99, 1, 2, 3, 4])
         self.assertEqual(responses[0]["error"]["code"], -32002)
         self.assertEqual(responses[1]["result"]["serverInfo"]["version"], __version__)
-        self.assertEqual([t["name"] for t in responses[2]["result"]["tools"]], ["gta_rpf_prepare", "gta_rpf_status"])
+        tools = responses[2]["result"]["tools"]
+        self.assertCountEqual([t["name"] for t in tools], [
+            "gta_rpf_prepare", "gta_rpf_status", "gta_rpf_inspect_dlc", "gta_rpf_register_dlc",
+            "gta_rpf_replace_gameconfig", "gta_rpf_build_vehicle_pack", "gta_rpf_build_ped_pack",
+            "gta_rpf_update_menyoo", "gta_rpf_describe_job", "gta_rpf_list_entries",
+            "gta_rpf_read_entry", "gta_rpf_write_entry", "gta_rpf_create_archive",
+        ])
         self.assertTrue(responses[3]["result"]["isError"])
         self.assertIn("error", responses[4])
 

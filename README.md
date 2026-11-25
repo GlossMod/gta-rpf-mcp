@@ -10,15 +10,37 @@ uvx gta-rpf-mcp@latest
 
 For an MCP client, select `stdio`, command `uvx`, and arguments `["gta-rpf-mcp@latest"]`. Python 3.11+ is required. The server uses the Python standard library and Windows CNG for AES. All runtime assets ship in the wheel. The original 205014 ZIP, PowerShell and .NET are unnecessary.
 
-| AMM operation | Legacy | Enhanced |
+## MCP tools
+
+Version 1.2.0 exposes the following operations through `tools/list`. Both AMM adapters start the same server and show the same catalog. The edition recorded in each job determines which operations it can run.
+
+| Tool | Operation on the staged copy | Editions |
 | --- | --- | --- |
-| Read `setup2.xml` to identify an existing DLC | Yes | Yes |
-| Register a DLC in `common/data/dlclist.xml` | Yes | Yes |
-| Replace `common/data/gameconfig.xml` | Yes | Yes |
-| Build a GMM DLC from loose vehicle or Ped resources | Yes, Legacy RSC7 | Unverified |
-| Generate Menyoo model list entries | Yes | Unverified |
+| `gta_rpf_inspect_dlc` | Read `setup2.xml` and return the DLC pack name. | Legacy, Enhanced |
+| `gta_rpf_register_dlc` | Register an existing DLC in `common/data/dlclist.xml`. | Legacy, Enhanced |
+| `gta_rpf_replace_gameconfig` | Replace `common/data/gameconfig.xml`. | Legacy, Enhanced |
+| `gta_rpf_build_vehicle_pack` | Build a GMM DLC containing the selected loose vehicle resources. | Legacy |
+| `gta_rpf_build_ped_pack` | Build a GMM DLC containing the selected Ped resources and metadata. | Legacy |
+| `gta_rpf_update_menyoo` | Rebuild the Menyoo vehicle list from the job's models. | Legacy |
+| `gta_rpf_prepare` | Run any supported job, including multi-target rebuilds and empty uninstall jobs. | Legacy, Enhanced |
+| `gta_rpf_status` | Report backend readiness, version and supported operations. | Legacy, Enhanced |
+| `gta_rpf_describe_job` | Discover input paths, archive references and the preparation tools applicable to this job. | Legacy, Enhanced |
+| `gta_rpf_list_entries` | List paths in a staged RPF7, including nested archives. | Supported RPF7 archives |
+| `gta_rpf_read_entry` | Read an entry by path, with paging and a whole-entry digest. | Supported RPF7 entries |
+| `gta_rpf_write_entry` | Replace an existing binary entry from a manifest input and verify the new archive copy. | Supported RPF7 binary entries |
+| `gta_rpf_create_archive` | Build an OPEN RPF7 from named input files, including nested archive directories. | Supported RPF7 inputs |
+
+Use the `mcpTool` and `jobId` returned by AMM's `prepare_gta_rpf_job`. Each of the six operation-specific preparation tools takes only `{"jobId":"…"}`. A matching tool stages every target in the job in one call. For example, a Legacy vehicle job may also rebuild the DLC registration and Menyoo list. Calling a tool whose operation is absent returns `tool_job_mismatch` before it consumes the job. After success, use the receipt for that job. Older AMM clients can continue to use `gta_rpf_prepare`.
 
 `gta_rpf_status({})` returns `backend`, `version`, `ready` and separate `legacyJobs` and `enhancedJobs` lists. A mod still needs to match the edition and game build. For Enhanced DLC jobs, supply an existing Enhanced-compatible `dlc.rpf` and leave Menyoo off.
+
+### Calling the archive tools
+
+1. Call `gta_rpf_describe_job({"jobId": …})`. An archive input includes `archive: {path, name}` with its canonical basename for decryption. Other manifest inputs have a `path` usable as `sourcePath`. Use the returned `nextOffset` to page through inputs.
+2. Pass the returned `archive` to `gta_rpf_list_entries({jobId, archive})`. Pick an exact `entry` from `entries` and call `gta_rpf_read_entry({jobId, archive, entry})`. Use `encoding: "utf8"` to read XML as text. The default is `base64`. A read returns the entry size, SHA-256, encoding, data and next byte offset.
+3. For a standalone edit, call `gta_rpf_write_entry({jobId, archive, entry, sourcePath})`. To build an archive, call `gta_rpf_create_archive({jobId, archiveName: "dlc.rpf", entries: [{entry: "setup2.xml", sourcePath}]})`. Use the returned `archive` directly in another list, read or write call. Paths such as `x64/models.rpf/example.xml` request a nested archive during creation.
+
+Archive tools use the existing job workspace. Write and create produce a private copy, independently of the single-use AMM preparation receipt. Use the operation-specific preparation tool to stage an installation for AMM review. The binary-entry writer handles existing files. Creation supports nested archives and supported resource versions. Enhanced loose model installation and Menyoo remain outside the supported job types.
 
 The RPF7 layout and encryption follow [Cryma/gta-toolkit](https://github.com/Cryma/gta-toolkit). The read, write, create and recursive listing operations follow [GlossMod/gmm-plug-in/rpf](https://github.com/GlossMod/gmm-plug-in/tree/main/rpf). Revisions, license notices and the template provenance are in `THIRD-PARTY-NOTICES.txt`.
 

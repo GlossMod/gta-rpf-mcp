@@ -11,7 +11,7 @@ from .rpf7 import RpfError
 from .rpf_crypto import RpfCryptoError
 from .gta_xml import (DLCLIST, GAMECONFIG, PED_META, XML_MAX, add_peds, dlclist, document, inventory,
                       parse_xml, setup_pack, textual_xml, update_menyoo, vehicle_models)
-from .protocol import IDENTIFIER, MAX_FILE_BYTES, OUTPUT_NAMES, Rejected, invalid, parse_job, token
+from .protocol import IDENTIFIER, MAX_FILE_BYTES, OUTPUT_NAMES, Rejected, invalid, job_operations, parse_job, token
 from .workspace import (copy_file, held_dir, held_tree, load_input, metadata, open_file, path_absent,
                         promote, read_limited, snapshot_file, split_relative)
 
@@ -282,16 +282,24 @@ def _write(path, data):
         os.fsync(out.fileno())
 
 
-def prepare(jobs: Path, job_id: str, backend_factory=ArchiveBackend):
+def prepare(jobs: Path, job_id: str, backend_factory=ArchiveBackend, *, operation: str | None = None):
     from .protocol import JOB_ID
 
     token(job_id, JOB_ID, "job ID")
     job = jobs / job_id
     try:
         with held_tree(job):
+            # Reject a mismatched tool before claiming the one-shot job. Use the same
+            # parsed manifest for validation and execution, even if input.json changes.
+            parsed = None
+            if operation is not None:
+                parsed = parse_job(load_input(job), job_id, split_relative)
+                targets, _, inspect_dlc = parsed
+                if operation not in job_operations(targets, inspect_dlc):
+                    raise Rejected("tool_job_mismatch", "This AMM job does not contain the requested operation.")
             try:
                 with (job / ".prepare.lock").open("xb"):
-                    return _prepare_locked(job, jobs, job_id, backend_factory)
+                    return _prepare_locked(job, jobs, job_id, backend_factory, parsed)
             except FileExistsError as exc:
                 raise Rejected("job_already_used", "The task is already running or has been used.") from exc
     except FileNotFoundError as exc:
@@ -300,7 +308,7 @@ def prepare(jobs: Path, job_id: str, backend_factory=ArchiveBackend):
         raise Rejected("unsafe_workspace", "The task workspace or file could not be securely opened.") from exc
 
 
-def _prepare_locked(job, jobs, job_id, backend_factory):
+def _prepare_locked(job, jobs, job_id, backend_factory, parsed):
     base = {"schemaVersion": 1, "jobId": job_id}
     if not path_absent(job / "output") or not path_absent(job / "result.json"):
         raise Rejected("job_already_used", "The task output already exists.")
@@ -308,7 +316,9 @@ def _prepare_locked(job, jobs, job_id, backend_factory):
         work = Path(temp)
         with held_dir(work):
             try:
-                result = _prepare_work(job, jobs, job_id, work, base, backend_factory)
+                if parsed is None:
+                    parsed = parse_job(load_input(job), job_id, split_relative)
+                result = _prepare_work(job, jobs, work, base, backend_factory, parsed)
             except Rejected as exc:
                 result = {**base, "status": "error", "code": exc.code, "message": str(exc)}
             except (RpfError, RpfCryptoError) as exc:
@@ -323,8 +333,8 @@ def _prepare_locked(job, jobs, job_id, backend_factory):
             return result
 
 
-def _prepare_work(job, jobs, job_id, work, base, backend_factory):
-    targets, refs, inspect_dlc = parse_job(load_input(job), job_id, split_relative)
+def _prepare_work(job, jobs, work, base, backend_factory, parsed):
+    targets, refs, inspect_dlc = parsed
     snapshots = {}
     if refs:
         folder = work / "inputs"
