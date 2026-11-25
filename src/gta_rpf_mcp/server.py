@@ -16,7 +16,7 @@ _LINE = 1024 * 1024
 _EMPTY = {"type": "object", "properties": {}, "additionalProperties": False}
 _JOB_ID_SCHEMA = {
     "type": "string", "pattern": "^[0-9a-f]{32}$", "minLength": 32, "maxLength": 32,
-    "description": "The jobId returned by AMM's native prepare_gta_rpf_job tool for this game.",
+    "description": "Job ID returned by AMM for the selected game.",
 }
 _JOB_SCHEMA = {**_EMPTY, "properties": {"jobId": _JOB_ID_SCHEMA}, "required": ["jobId"]}
 _READ_HINTS = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
@@ -84,7 +84,7 @@ class Server:
                     raise RpcError(-32602, "Invalid page bounds")
                 value, operations = describe_job(workspace_parent(), job_id, offset, limit)
                 value["preparationTools"] = [tool for tool, (op, _) in _JOB_TOOLS.items()
-                                             if op is None or op in operations]
+                                             if op in operations]
             elif name in _JOB_TOOLS and args.keys() == {"jobId"}:
                 job_id = token(args["jobId"], JOB_ID, "job ID")
                 value = prepare(workspace_parent(), job_id, operation=_JOB_TOOLS[name][0])

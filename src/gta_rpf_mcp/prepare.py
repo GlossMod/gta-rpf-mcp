@@ -291,9 +291,14 @@ def prepare(jobs: Path, job_id: str, backend_factory=ArchiveBackend, *, operatio
         with held_tree(job):
             # Reject a mismatched tool before claiming the one-shot job. Use the same
             # parsed manifest for validation and execution, even if input.json changes.
-            parsed = None
-            if operation is not None:
+            try:
                 parsed = parse_job(load_input(job), job_id, split_relative)
+            except Rejected as exc:
+                if operation is not None or exc.code == "tool_job_mismatch":
+                    raise
+                # Ordinary invalid installation jobs retain their single-use error receipt.
+                parsed = exc
+            if operation is not None:
                 targets, _, inspect_dlc = parsed
                 if operation not in job_operations(targets, inspect_dlc):
                     raise Rejected("tool_job_mismatch", "This AMM job does not contain the requested operation.")
@@ -316,8 +321,8 @@ def _prepare_locked(job, jobs, job_id, backend_factory, parsed):
         work = Path(temp)
         with held_dir(work):
             try:
-                if parsed is None:
-                    parsed = parse_job(load_input(job), job_id, split_relative)
+                if isinstance(parsed, Rejected):
+                    raise parsed
                 result = _prepare_work(job, jobs, work, base, backend_factory, parsed)
             except Rejected as exc:
                 result = {**base, "status": "error", "code": exc.code, "message": str(exc)}

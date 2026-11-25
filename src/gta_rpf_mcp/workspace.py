@@ -150,9 +150,10 @@ def open_file(path: Path):
         yield stream
 
 
-def read_limited(path: Path, bound: int) -> bytes:
+def read_limited(path: Path, bound: int, *, allow_empty=False) -> bytes:
     with open_file(path) as src:
-        if not 0 < os.fstat(src.fileno()).st_size <= bound:
+        minimum = 0 if allow_empty else 1
+        if not minimum <= os.fstat(src.fileno()).st_size <= bound:
             raise invalid("Required file is empty or exceeds its size limit.")
         data = src.read(bound + 1)
     if len(data) > bound:

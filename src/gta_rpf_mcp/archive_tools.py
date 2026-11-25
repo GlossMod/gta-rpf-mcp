@@ -11,7 +11,7 @@ import tempfile
 from uuid import uuid4
 
 from . import rpf7
-from .protocol import JOB_ID, SHA256, Rejected, invalid, parse_job, record, token
+from .protocol import JOB_ID, SHA256, Rejected, invalid, parse_job, record, standalone_inputs, token
 from .rpf_crypto import RpfCryptoError
 from .workspace import (
     held_dir, held_tree, load_input, metadata, promote, read_limited,
@@ -51,7 +51,7 @@ _ARCHIVE = {
         "size": {"type": "integer", "minimum": 16, "maximum": _MAX_ARCHIVE_BYTES},
     }, ["path", "name"]),
     "dependentRequired": {"sha256": ["size"], "size": ["sha256"]},
-    "description": "Pass gta_rpf_describe_job inputs[].archive or result.archive from create or write as returned.",
+    "description": "Pass gta_rpf_describe_job inputs[].archive or result.archive from an archive mutation as returned.",
     "examples": [{"path": "inputs/4a8e1f0c", "name": "update.rpf"}],
 }
 
@@ -77,9 +77,15 @@ ARCHIVE_TOOLS = [
         "encoding": {"type": "string", "enum": ["base64", "utf8"], "default": "base64",
                      "description": "UTF-8 pages end on character boundaries. Offsets and sizes are always bytes."},
     }, ["archive", "entry"], reads=True),
-    _tool("gta_rpf_write_entry", "Replace an existing binary RPF7 entry with a job input and return a verified staged copy.", {
+    _tool("gta_rpf_write_entry", "Replace an existing binary or supported RPF7 resource file with a job input and return a verified staged copy.", {
         "archive": _ARCHIVE, "entry": _ENTRY, "sourcePath": _INPUT,
     }, ["archive", "entry", "sourcePath"], reads=False),
+    _tool("gta_rpf_add_entry", "Add a new file from a job input to the root or an existing nested RPF7 archive. Create ordinary parent directories if needed and return a verified staged copy.", {
+        "archive": _ARCHIVE, "entry": _ENTRY, "sourcePath": _INPUT,
+    }, ["archive", "entry", "sourcePath"], reads=False),
+    _tool("gta_rpf_delete_entry", "Remove an existing file from the root or a nested RPF7 archive and return a verified staged copy. Does not delete directories or nested archive containers.", {
+        "archive": _ARCHIVE, "entry": _ENTRY,
+    }, ["archive", "entry"], reads=False),
     _tool("gta_rpf_create_archive", "Build an OPEN RPF7 archive from verified job inputs. Directories ending in .rpf become nested archives.", {
         "archiveName": _NAME,
         "entries": {"type": "array", "minItems": 1, "maxItems": _MAX_BUILD_ENTRIES,
@@ -125,6 +131,8 @@ def _archive_reference(value, refs: dict) -> tuple[str, dict, list[str]]:
         token(parts[1], JOB_ID, "staged archive ID")
         return name, {"path": name, **expected}, parts[:-1]
     ref = _input_reference(value["path"], refs)
+    if "role" in ref and (ref["role"] != "archive" or ref["name"] != name):
+        raise invalid("Use the archive reference issued for this job.")
     _integer(ref["size"], 16, _MAX_ARCHIVE_BYTES, "archive byte size")
     if expected is not None and any(ref[key] != val for key, val in expected.items()):
         raise invalid("Archive metadata does not match its job input reference.")
@@ -153,6 +161,8 @@ def _snapshot_archive(job: Path, archive: tuple[str, dict, list[str]], staging: 
 
 def _entry_source(value, refs: dict) -> dict:
     ref = _input_reference(value, refs)
+    if "role" in ref and ref["role"] != "payload":
+        raise invalid("Use a declared payload as the entry source.")
     if ref["size"] > _MAX_ENTRY_BYTES:
         raise invalid("Entry source exceeds 128 MiB.")
     return ref
@@ -262,9 +272,9 @@ def _execute(job: Path, name: str, args: dict, refs: dict) -> dict:
         archive_ref = _archive_reference(args["archive"], refs)
         if name != "gta_rpf_list_entries":
             entry = _entry_path(args["entry"])
-        if name == "gta_rpf_write_entry":
+        if name in {"gta_rpf_write_entry", "gta_rpf_add_entry"}:
             source = _entry_source(args["sourcePath"], refs)
-        else:
+        elif name in {"gta_rpf_list_entries", "gta_rpf_read_entry"}:
             offset = _integer(args.get("offset", 0), 0, _MAX_ARCHIVE_BYTES, "page offset")
             limit_schema = _SCHEMAS[name]["properties"]["limit"]
             limit = _integer(args.get("limit", limit_schema["default"]), 1, limit_schema["maximum"], "page limit")
@@ -287,12 +297,20 @@ def _execute(job: Path, name: str, args: dict, refs: dict) -> dict:
                         return _list_page(archive, offset, limit)
                     if name == "gta_rpf_read_entry":
                         return _read_page(archive, entry, offset, limit, encoding)
-                    payload = work / "replacement"
-                    snapshot_file(job, source, payload)
-                    rpf7.replace_entry(archive, entry, read_limited(payload, _MAX_ENTRY_BYTES))
-                    _verify(archive, {entry: (source["sha256"], source["size"])})
+                    if name == "gta_rpf_delete_entry":
+                        rpf7.delete_entry(archive, entry)
+                        try:
+                            rpf7.verify_entry_absent(archive, entry)
+                        except (rpf7.RpfError, RpfCryptoError) as exc:
+                            raise Rejected("verification_failed", "Reopened archive did not confirm the entry deletion.") from exc
+                    else:
+                        payload = work / "payload"
+                        snapshot_file(job, source, payload)
+                        edit = rpf7.add_entry if name == "gta_rpf_add_entry" else rpf7.replace_entry
+                        edit(archive, entry, read_limited(payload, _MAX_ENTRY_BYTES, allow_empty=True))
+                        _verify(archive, {entry: (source["sha256"], source["size"])})
             result = {"archive": _publish(job, output, archive)}
-            if name == "gta_rpf_write_entry":
+            if name != "gta_rpf_create_archive":
                 result["entry"] = entry
             return result
 
@@ -312,9 +330,14 @@ def call_archive_tool(name: str, args: dict) -> dict:
                 stack.enter_context(held_tree(job))
             except FileNotFoundError as exc:
                 raise Rejected("missing_workspace", "The fixed task workspace does not exist.") from exc
-            _, refs, _ = parse_job(load_input(job), job_id, split_relative)
+            manifest = load_input(job)
+            refs = standalone_inputs(manifest, job_id, split_relative)
+            if refs is None:
+                _, refs, _ = parse_job(manifest, job_id, split_relative)
             result = _execute(job, name, args, {ref["path"]: ref for ref in refs})
             return {"schemaVersion": 1, "jobId": job_id, "status": "ok", **result}
+    except rpf7.EntryExistsError as exc:
+        raise Rejected("entry_exists", "An RPF7 entry already occupies the requested path or its parent.") from exc
     except rpf7.EntryNotFoundError as exc:
         raise Rejected("entry_not_found", "Requested RPF7 entry was not found.") from exc
     except (rpf7.RpfError, RpfCryptoError) as exc:

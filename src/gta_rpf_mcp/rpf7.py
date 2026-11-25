@@ -51,6 +51,10 @@ class EntryNotFoundError(RpfError):
     """The requested file does not exist in the archive."""
 
 
+class EntryExistsError(RpfError):
+    """The requested file path is already occupied."""
+
+
 def _align(value: int, unit: int = _BLOCK) -> int:
     return (value + unit - 1) // unit * unit
 
@@ -66,13 +70,19 @@ def _name_key(name: str) -> str:
     return name.casefold()
 
 
-def _path_keys(path: str) -> list[str]:
+def _path_parts(path: str) -> list[str]:
     if not isinstance(path, str) or len(path) > (_MAX_NAME + 1) * _MAX_DEPTH:
         raise RpfError("RPF7 entry path exceeds its size limit.")
     parts = path.replace("\\", "/").split("/")
     if len(parts) > _MAX_DEPTH:
         raise RpfError("RPF7 entry path exceeds its depth limit.")
-    return [_name_key(part) for part in parts]
+    for part in parts:
+        _name_key(part)
+    return parts
+
+
+def _path_keys(path: str) -> list[str]:
+    return [part.casefold() for part in _path_parts(path)]
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +130,7 @@ class _Archive:
     table: bytes
     names: bytes
     files: dict[str, tuple[str, _File]]
+    directories: dict[str, int]
 
     @property
     def toc_end(self) -> int:
@@ -186,6 +197,7 @@ def _parse(view: _View, budget: _Budget) -> _Archive:
     pending = [("", "", first, length, 0)]
     seen = {0}
     files = {}
+    directories = {"": 0}
     extents = []
     while pending:
         prefix, key_prefix, first, length, depth = pending.pop()
@@ -208,6 +220,7 @@ def _parse(view: _View, budget: _Budget) -> _Archive:
             budget.add_path(path)
             budget.add_path(path_key)
             if directory:
+                directories[path_key] = index
                 pending.append((path + "/", path_key + "/", c, d, depth + 1))
                 continue
 
@@ -240,7 +253,7 @@ def _parse(view: _View, budget: _Budget) -> _Archive:
         if offset < end:
             raise RpfError("RPF7 files have overlapping data ranges.")
         end = next_end
-    return _Archive(view, mode, table, names, files)
+    return _Archive(view, mode, table, names, files, directories)
 
 
 def _payload_chunks(archive: _Archive, entry: _File) -> Iterator[bytes]:
@@ -324,12 +337,20 @@ def _open_nested(archive: _Archive, entry: _File, budget: _Budget) -> Iterator[_
         yield _View(stream, 0, entry.unpacked, entry.name)
 
 
-def _locate(archive: _Archive, parts: list[str]) -> tuple[_File, list[str]]:
+def _nested_prefix(archive: _Archive, parts: list[str]) -> tuple[_File, int] | None:
     for index in range(1, len(parts)):
         key = "/".join(parts[:index])
         match = archive.files.get(key)
         if match is not None and _nested(*match):
-            return match[1], parts[index:]
+            return match[1], index
+    return None
+
+
+def _locate(archive: _Archive, parts: list[str]) -> tuple[_File, list[str]]:
+    nested = _nested_prefix(archive, parts)
+    if nested is not None:
+        entry, stop = nested
+        return entry, parts[stop:]
     match = archive.files.get("/".join(parts))
     if match is None:
         raise EntryNotFoundError("Requested RPF7 entry was not found.")
@@ -532,24 +553,172 @@ def _write_replacement(archive: _Archive, entry: _File, replacement: _View) -> N
         stream.write(names)
 
 
-def _replace(view: _View, parts: list[str], data: bytes, budget: _Budget, depth: int) -> int:
+def _rewrite_catalog(archive: _Archive, target: BinaryIO, budget: _Budget, *,
+                     parent: int = 0, addition: list[str] | None = None,
+                     data: bytes = b"", removed: int | None = None, replaced: int | None = None) -> None:
+    """Reindex directory ranges and copy retained file payloads in their stored form."""
+    old_count = len(archive.table) // _HEADER.size
+    new_names = addition or []
+    new_count = old_count + len(new_names)
+    old_files = {entry.index: entry for _, entry in archive.files.values()}
+    order = [0]
+    records = {}
+
+    def entry_name(index: int) -> str:
+        if index >= old_count:
+            return new_names[index - old_count]
+        if index in old_files:
+            return old_files[index].name
+        name_offset, _, _, _ = _HEADER.unpack_from(archive.table, index * _HEADER.size)
+        return _entry_name(archive.names, name_offset)
+
+    # A directory's children must be one contiguous range in the TOC.
+    for index in order:
+        children = None
+        if index >= old_count:
+            if index + 1 < new_count:
+                children = [index + 1]
+        elif index not in old_files:
+            _, _, first, count = _HEADER.unpack_from(archive.table, index * _HEADER.size)
+            children = [child for child in range(first, first + count) if child != removed]
+            if new_names and index == parent:
+                children.append(old_count)
+                children.sort(key=entry_name)
+        if children is not None:
+            records[index] = (len(order), len(children))
+            order.extend(children)
+
+    # File name offsets are 16-bit; directory offsets are 32-bit.
+    names = bytearray(b"\0")
+    offsets = {"": 0}
+    for directories in (False, True):
+        for index in order:
+            if (index in records) != directories:
+                continue
+            name = entry_name(index)
+            if name not in offsets:
+                offsets[name] = len(names)
+                names.extend(name.encode("utf-8") + b"\0")
+            if not directories and offsets[name] > 0xFFFF:
+                raise RpfError("RPF7 file name table exceeds the 16-bit file name range.")
+    if _align(len(names), 16) > _MAX_NAME_TABLE:
+        raise RpfError("RPF7 name table exceeds its limit.")
+    names.extend(bytes(-len(names) % 16))
+    offset = _align(_HEADER.size * (len(order) + 1) + len(names))
+    table = bytearray()
+    for index in order:
+        name = entry_name(index)
+        name_offset = offsets[name]
+        if index in records:
+            table.extend(_HEADER.pack(name_offset, _DIRECTORY, *records[index]))
+            continue
+        if index >= old_count or index == replaced:
+            table.extend(_source_record(target, _View(BytesIO(data), 0, len(data), name),
+                                        name_offset, offset, budget))
+            offset = _align(offset + len(data))
+            continue
+        entry = old_files[index]
+        a, b, c, d = _HEADER.unpack_from(archive.table, index * _HEADER.size)
+        stored = (a >> 16) | ((b & 0xFF) << 16)
+        end = _align(offset + entry.size)
+        if end > _MAX_ARCHIVE:
+            raise RpfError("Updated RPF7 archive exceeds its size limit.")
+        record = _file_record(name_offset, offset, stored, c, d, resource=entry.resource)
+        _copy(archive.view.part(entry.offset, entry.size), target, offset)
+        table.extend(record)
+        offset = end
+
+    # NG TOC encryption depends on the final archive size, not just the basename.
+    sealed_table, sealed_names = rpf_crypto.encrypt_toc(
+        archive.mode, archive.view.name, offset, bytes(table), bytes(names),
+    )
+    target.seek(0)
+    target.write(_HEADER.pack(_MAGIC, len(order), len(names), archive.mode))
+    target.write(sealed_table)
+    target.write(sealed_names)
+    target.truncate(offset)
+
+
+def _insert(archive: _Archive, target: BinaryIO, parts: list[str], keys: list[str],
+            data: bytes, budget: _Budget) -> None:
+    key = "/".join(keys)
+    if key in archive.files or key in archive.directories:
+        raise EntryExistsError("The requested RPF7 path already exists.")
+    if keys[-1].endswith(".rpf"):
+        raise RpfError("RPF7 addition requires a file other than a nested archive.")
+    parent = 0
+    start = 0
+    for index in range(1, len(parts)):
+        prefix = "/".join(keys[:index])
+        if prefix in archive.files:
+            raise EntryExistsError("An RPF7 file occupies the requested parent path.")
+        if prefix not in archive.directories:
+            break
+        parent = archive.directories[prefix]
+        start = index
+    addition = parts[start:]
+    if any(part.casefold().endswith(".rpf") for part in addition[:-1]):
+        raise EntryNotFoundError("The enclosing nested RPF7 archive was not found.")
+    budget.add(len(addition))
+    for index in range(start + 1, len(parts) + 1):
+        budget.add_path("/".join(parts[:index]))
+        budget.add_path("/".join(keys[:index]))
+    _rewrite_catalog(archive, target, budget, parent=parent, addition=addition, data=data)
+
+
+def _edit(source: _View, target: BinaryIO, parts: list[str], data: bytes,
+          op: str, budget: _Budget, depth: int) -> int:
+    if depth > _MAX_NESTED:
+        raise RpfError("Nested RPF7 depth exceeds its limit.")
+    archive = _parse(source, budget)
+    keys = [part.casefold() for part in parts]
+    nested = _nested_prefix(archive, keys)
+    if nested is not None:
+        entry, stop = nested
+        with _open_nested(archive, entry, budget) as child, tempfile.TemporaryFile() as replacement:
+            size = _edit(child, replacement, parts[stop:], data, op, budget, depth + 1)
+            _copy(source, target)
+            archive.view = _View(target, 0, source.size, source.name)
+            _write_replacement(archive, entry, _View(replacement, 0, size, entry.name))
+    elif op == "add":
+        _insert(archive, target, parts, keys, data, budget)
+    else:
+        entry, _ = _locate(archive, keys)
+        if _nested(entry.name, entry):
+            raise RpfError("RPF7 file edits cannot replace or delete a nested archive.")
+        if op == "delete":
+            _rewrite_catalog(archive, target, budget, removed=entry.index)
+        elif entry.resource:
+            if data[:4] not in {_RSC7.to_bytes(4, "little"), _RSC7_RAGELIB.to_bytes(4, "little")}:
+                raise RpfError("RPF7 resource replacement requires a supported RSC7 header.")
+            _rewrite_catalog(archive, target, budget, data=data, replaced=entry.index)
+        else:
+            _copy(source, target)
+            archive.view = _View(target, 0, source.size, source.name)
+            _write_replacement(archive, entry, _View(BytesIO(data), 0, len(data), entry.name))
+    return target.seek(0, os.SEEK_END)
+
+
+def _verify_absent(view: _View, keys: list[str], budget: _Budget, depth: int) -> None:
     if depth > _MAX_NESTED:
         raise RpfError("Nested RPF7 depth exceeds its limit.")
     archive = _parse(view, budget)
-    entry, rest = _locate(archive, parts)
-    if entry.resource or (not rest and _nested(entry.name, entry)):
-        raise RpfError("RPF7 replacement requires an existing binary file.")
-    with tempfile.TemporaryFile() as replacement:
-        if rest:
-            budget.add_packed_archive(entry)
-            _extract_binary(archive, entry, replacement.write)
-            nested = _View(replacement, 0, entry.unpacked, entry.name)
-            size = _replace(nested, rest, data, budget, depth + 1)
-        else:
-            replacement.write(data)
-            size = len(data)
-        _write_replacement(archive, entry, _View(replacement, 0, size, entry.name))
-    return view.stream.seek(0, os.SEEK_END)
+    nested = _nested_prefix(archive, keys)
+    if nested is not None:
+        entry, stop = nested
+        with _open_nested(archive, entry, budget) as child:
+            _verify_absent(child, keys[stop:], budget, depth + 1)
+        return
+    path = "/".join(keys)
+    if "/".join(keys[:-1]) not in archive.directories or path in archive.files or path in archive.directories:
+        raise RpfError("RPF7 deletion readback requires an existing parent and an absent entry.")
+
+
+def verify_entry_absent(archive: Path, entry: str) -> None:
+    """Reopen an archive and verify deletion without mistaking a missing parent for success."""
+    keys = _path_keys(entry)
+    with archive.open("rb") as stream:
+        _verify_absent(_View(stream, 0, os.fstat(stream.fileno()).st_size, archive.name), keys, _Budget(), 0)
 
 
 @contextmanager
@@ -563,28 +732,41 @@ def _staged(destination: Path) -> Iterator[Path]:
         temporary.unlink(missing_ok=True)
 
 
-def replace_entry(archive: Path, entry: str, data: bytes) -> None:
-    """Atomically replace an existing binary entry in a staged copy of the archive."""
+def _edit_file(archive: Path, entry: str, op: str, data: bytes = b"") -> None:
     if not isinstance(data, bytes) or len(data) > _MAX_ENTRY_BYTES:
-        raise RpfError("RPF7 replacement exceeds its size limit or is not bytes.")
-    parts = _path_keys(entry)
+        raise RpfError("RPF7 input exceeds its size limit or is not bytes.")
+    parts = _path_parts(entry)
     if _is_link(archive.lstat()):
-        raise RpfError("RPF7 replacement requires a regular archive file.")
+        raise RpfError("RPF7 edit requires a regular archive file.")
     with _staged(archive) as temporary:
         with archive.open("rb") as source, temporary.open("r+b") as target:
             original = os.fstat(source.fileno())
             if not stat.S_ISREG(original.st_mode) or not _HEADER.size <= original.st_size <= _MAX_ARCHIVE:
-                raise RpfError("RPF7 replacement requires a valid archive size.")
-            _copy(_View(source, 0, original.st_size, archive.name), target)
-            _replace(_View(target, 0, original.st_size, archive.name), parts, data, _Budget(), 0)
+                raise RpfError("RPF7 edit requires a valid archive size.")
+            _edit(_View(source, 0, original.st_size, archive.name), target, parts, data, op, _Budget(), 0)
             target.flush()
             os.fsync(target.fileno())
         current = archive.lstat()
         # Windows can expose different ctime semantics for the file handle and path.
         if (_is_link(current) or not os.path.samestat(original, current)
                 or (original.st_size, original.st_mtime_ns) != (current.st_size, current.st_mtime_ns)):
-            raise RpfError("RPF7 archive changed during replacement.")
+            raise RpfError("RPF7 archive changed during edit.")
         temporary.chmod(stat.S_IMODE(original.st_mode))
+
+
+def replace_entry(archive: Path, entry: str, data: bytes) -> None:
+    """Atomically replace an existing binary or supported resource file."""
+    _edit_file(archive, entry, "replace", data)
+
+
+def add_entry(archive: Path, entry: str, data: bytes) -> None:
+    """Atomically add a new binary or supported resource file; create ordinary parents as needed."""
+    _edit_file(archive, entry, "add", data)
+
+
+def delete_entry(archive: Path, entry: str) -> None:
+    """Atomically delete a file without deleting its directory or enclosing nested archive."""
+    _edit_file(archive, entry, "delete")
 
 
 def _is_link(info: os.stat_result) -> bool:
@@ -654,24 +836,25 @@ def _discard(_chunk: bytes) -> None:
     pass
 
 
-def _source_record(stream: BinaryIO, source: _View, entry: _BuildEntry, offset: int, budget: _Budget) -> bytes:
+def _source_record(stream: BinaryIO, source: _View, name_offset: int, offset: int,
+                   budget: _Budget, *, validate_nested: bool = True) -> bytes:
     size = source.size
     if size > _MAX_ARCHIVE or _align(offset + size) > _MAX_ARCHIVE:
         raise RpfError("Created RPF7 archive exceeds its size limit.")
     magic = source.read(0, min(size, 4))
-    suffix = entry.name.casefold().rpartition(".")[2]
-    if suffix == "rpf" and not entry.nested:
+    suffix = source.name.casefold().rpartition(".")[2]
+    if suffix == "rpf" and validate_nested:
         _parse(source, budget)
     if magic in {_RSC7.to_bytes(4, "little"), _RSC7_RAGELIB.to_bytes(4, "little")}:
         header = source.read(0, _HEADER.size)
         _, version, system, graphics = _HEADER.unpack(header)
-        _check_resource_version(entry.name, version)
+        _check_resource_version(source.name, version)
         if version != _resource_version(system, graphics):
             raise RpfError("RPF7 resource version does not match its flags.")
         if suffix in _REQUIRED_RSC7:
             _inflate(source.part(_HEADER.size, size - _HEADER.size).chunks(),
                      _MAX_RESOURCE_EXPANSION, _discard, exact=False)
-        record = _file_record(entry.name_offset, offset, min(size, _SIZE24), system, graphics, resource=True)
+        record = _file_record(name_offset, offset, min(size, _SIZE24), system, graphics, resource=True)
         if size >= _SIZE24:
             extended = bytearray(header)
             for index, byte in zip((7, 14, 5, 2), size.to_bytes(4, "little")):
@@ -685,7 +868,7 @@ def _source_record(stream: BinaryIO, source: _View, entry: _BuildEntry, offset: 
     else:
         if suffix in _REQUIRED_RSC7 and (suffix != "ymt" or magic != b"PSIN"):
             raise RpfError("Model source is missing a supported RSC7 resource header.")
-        record = _binary_record(entry.name_offset, offset, 0, size, False)
+        record = _binary_record(name_offset, offset, 0, size, False)
     _copy(source, stream, offset)
     return record
 
@@ -703,7 +886,8 @@ def _build(root: Path, name: str, stream: BinaryIO, budget: _Budget, depth: int)
         if entry.nested:
             with tempfile.TemporaryFile() as child:
                 size = _build(entry.path, entry.name, child, budget, depth + 1)
-                table.extend(_source_record(stream, _View(child, 0, size, entry.name), entry, offset, budget))
+                table.extend(_source_record(stream, _View(child, 0, size, entry.name),
+                                            entry.name_offset, offset, budget, validate_nested=False))
         else:
             with entry.path.open("rb") as source:
                 info = os.fstat(source.fileno())
@@ -712,7 +896,8 @@ def _build(root: Path, name: str, stream: BinaryIO, budget: _Budget, depth: int)
                         or not os.path.samestat(info, current)):
                     raise RpfError("RPF7 source must contain only regular files and directories.")
                 size = info.st_size
-                table.extend(_source_record(stream, _View(source, 0, size, entry.name), entry, offset, budget))
+                table.extend(_source_record(stream, _View(source, 0, size, entry.name),
+                                            entry.name_offset, offset, budget))
         offset = _align(offset + size)
     stream.seek(0)
     stream.write(_HEADER.pack(_MAGIC, len(entries), len(names), rpf_crypto.OPEN))

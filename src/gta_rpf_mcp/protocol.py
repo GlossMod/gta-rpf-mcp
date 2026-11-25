@@ -74,27 +74,68 @@ def model_path(value, kind: str, streamed: bool = False) -> str:
     return "/".join(parts).lower()
 
 
-def parse_job(value, job_id: str, parse_path):
-    inspection = isinstance(value, dict) and "inspectDlc" in value
-    keys = {"schemaVersion", "jobId", "kind", "targets"}
-    job = record(value, keys | ({"inspectDlc"} if inspection else set()), "job")
+def _job_header(job, job_id):
     if type(job["schemaVersion"]) is not int or job["schemaVersion"] != 1 or job["jobId"] != job_id:
         raise invalid("Unsupported schema version or mismatched job ID.")
     if job["kind"] not in ("legacy", "enhanced"):
         raise invalid("Unsupported game edition.")
+
+
+def _file_reference(value, parse_path, *, minimum=1, maximum=MAX_FILE_BYTES):
+    file_ref = record(value, {"path", "sha256", "size"}, "file reference")
+    path = "/".join(parse_path(file_ref["path"]))
+    token(file_ref["sha256"], SHA256, "SHA-256")
+    if type(file_ref["size"]) is not int or not minimum <= file_ref["size"] <= maximum:
+        raise invalid("Invalid file size.")
+    return {**file_ref, "path": path}
+
+
+def standalone_inputs(value, job_id, parse_path):
+    """Return scoped archive/payload rows, or None for a deployment job."""
+    if not isinstance(value, dict) or "archiveInputs" not in value:
+        return None
+    job = record(value, {"schemaVersion", "jobId", "kind", "archiveInputs", "payloadInputs"}, "archive job")
+    _job_header(job, job_id)
+    if not isinstance(job["archiveInputs"], list) or len(job["archiveInputs"]) != 1:
+        raise invalid("Select one RPF archive for this job.")
+    if not isinstance(job["payloadInputs"], list) or len(job["payloadInputs"]) >= MAX_JOB_FILES:
+        raise invalid("Invalid archive payload list.")
+    archive = record(job["archiveInputs"][0], {"name", "source"}, "archive input")
+    name = archive["name"]
+    if len(parse_path(name)) != 1 or len(name) < 5 or not name.lower().endswith(".rpf"):
+        raise invalid("Invalid RPF archive basename.")
+    source = _file_reference(archive["source"], parse_path, minimum=16, maximum=0xffffffff)
+    rows = [{**source, "role": "archive", "name": name,
+             "archive": {"path": source["path"], "name": name}}]
+    seen = {source["path"].casefold()}
+    total = source["size"]
+    for payload in job["payloadInputs"]:
+        source = _file_reference(payload, parse_path, minimum=0, maximum=128 * 1024**2)
+        key = source["path"].casefold()
+        if key in seen:
+            raise invalid("Duplicate archive job input.")
+        seen.add(key)
+        total += source["size"]
+        if total > MAX_JOB_INPUT_BYTES:
+            raise invalid("The job exceeds the input budget.")
+        rows.append({**source, "role": "payload", "name": source["path"].rsplit("/", 1)[-1]})
+    return rows
+
+
+def parse_job(value, job_id: str, parse_path):
+    if standalone_inputs(value, job_id, parse_path) is not None:
+        raise Rejected("tool_job_mismatch", "Use the individual archive tools for a standalone archive job.")
+    inspection = isinstance(value, dict) and "inspectDlc" in value
+    keys = {"schemaVersion", "jobId", "kind", "targets"}
+    job = record(value, keys | ({"inspectDlc"} if inspection else set()), "job")
+    _job_header(job, job_id)
     if not isinstance(job["targets"], list) or len(job["targets"]) > len(_ALLOWED):
         raise invalid("Invalid target list.")
     refs = {}
 
     def ref(value):
-        file_ref = record(value, {"path", "sha256", "size"}, "file reference")
-        relative = parse_path(file_ref["path"])
-        token(file_ref["sha256"], SHA256, "SHA-256")
-        if type(file_ref["size"]) is not int or not 0 < file_ref["size"] <= MAX_FILE_BYTES:
-            raise invalid("Invalid file size.")
-        key = "/".join(relative)
-        canonical = key.casefold()
-        parsed = {**file_ref, "path": key}
+        parsed = _file_reference(value, parse_path)
+        canonical = parsed["path"].casefold()
         if canonical in refs and refs[canonical] != parsed:
             raise invalid("Conflicting references to the same task file.")
         refs[canonical] = parsed

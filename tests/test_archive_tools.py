@@ -78,9 +78,11 @@ class ArchiveToolsTests(unittest.TestCase):
 
     def test_tool_definitions_are_independent(self):
         self.assertEqual([tool["name"] for tool in ARCHIVE_TOOLS], [
-            "gta_rpf_list_entries", "gta_rpf_read_entry", "gta_rpf_write_entry", "gta_rpf_create_archive",
+            "gta_rpf_list_entries", "gta_rpf_read_entry", "gta_rpf_write_entry",
+            "gta_rpf_add_entry", "gta_rpf_delete_entry", "gta_rpf_create_archive",
         ])
-        self.assertEqual([tool["annotations"]["readOnlyHint"] for tool in ARCHIVE_TOOLS], [True, True, False, False])
+        self.assertEqual([tool["annotations"]["readOnlyHint"] for tool in ARCHIVE_TOOLS],
+                         [True, True, False, False, False, False])
         self.assertTrue(all(not tool["inputSchema"]["additionalProperties"] for tool in ARCHIVE_TOOLS))
 
     def test_ng_manifest_roundtrip_in_each_edition_without_touching_job_outputs(self):
@@ -120,6 +122,66 @@ class ArchiveToolsTests(unittest.TestCase):
                 self.assertEqual((self.job / "input.json").read_bytes(), input_manifest)
                 self.assertEqual(official.read_bytes(), b"official AMM output")
                 self.assertEqual(result_file.read_bytes(), b"official AMM result")
+
+    def test_dlclist_file_crud_reopens_at_root_and_two_nested_levels_in_each_edition(self):
+        entry = "common/data/dlclist.xml"
+        nested_prefix = "x64/packs.rpf/content/inner.rpf/"
+        original_xml = b"<Paths><Item>dlcpacks:/original/</Item></Paths>"
+        updated_xml = b"<Paths><Item>dlcpacks:/updated/</Item></Paths>"
+        source = self.stage_input(updated_xml)
+        for edition in ("legacy", "enhanced"):
+            with self.subTest(edition=edition):
+                manifest = self.stage_manifest(edition, rpf_crypto.NG)
+                innermost = open_rpf_fixture({entry: original_xml, "keep.txt": b"inside"},
+                                            archive_name="inner.rpf", mode=rpf_crypto.NG, encrypt_files=True)
+                outer = open_rpf_fixture({"content/inner.rpf": innermost}, archive_name="packs.rpf")
+                raw = open_rpf_fixture({entry: original_xml, "keep.txt": b"outside", "x64/packs.rpf": outer},
+                                       archive_name="update.rpf", mode=rpf_crypto.NG, encrypt_files=True)
+                original = self.stage_input(raw)
+                manifest["targets"][0]["baseline"] = original
+                manifest["targets"][0]["contributions"][0]["source"] = source
+                self.save_manifest(manifest)
+                baseline = {"path": original["path"], "name": "update.rpf"}
+                for prefix in ("", nested_prefix):
+                    path = prefix + entry
+                    with self.subTest(path=path):
+                        self.assertEqual(self.entry_bytes(baseline, path), original_xml)
+                        self.reject("add_entry", "entry_exists", archive=baseline, entry=path.upper(), sourcePath=source["path"])
+                        written = self.call("write_entry", archive=baseline, entry=path, sourcePath=source["path"])["archive"]
+                        self.assertEqual(rpf7.read_entry(self.archive_file(written), path), updated_xml)
+                        text = self.call("read_entry", archive=written, entry=path, encoding="utf8")
+                        self.assertEqual((text["data"], text["sha256"]),
+                                         (updated_xml.decode(), hashlib.sha256(updated_xml).hexdigest()))
+                        deleted = self.call("delete_entry", archive=written, entry=path)
+                        self.assertEqual(deleted["entry"], path)
+                        removed = deleted["archive"]
+                        self.assertNotIn(path, rpf7.list_entries(self.archive_file(removed)))
+                        self.reject("read_entry", "entry_not_found", archive=removed, entry=path)
+                        self.reject("delete_entry", "entry_not_found", archive=removed, entry=path)
+                        added = self.call("add_entry", archive=removed, entry=path, sourcePath=source["path"])
+                        self.assertEqual(added["entry"], path)
+                        self.assertEqual(rpf7.read_entry(self.archive_file(added["archive"]), path), updated_xml)
+                        self.assertEqual(self.entry_bytes(added["archive"], prefix + "keep.txt"),
+                                         b"inside" if prefix else b"outside")
+                        self.assertEqual(self.entry_bytes(written, path), updated_xml)
+                        self.assertEqual((self.job / original["path"]).read_bytes(), raw)
+
+    def test_add_and_write_zero_byte_payload_in_standalone_job(self):
+        entry = "existing.txt"
+        raw = open_rpf_fixture({entry: b"content"}, archive_name="update.rpf")
+        baseline = self.stage_input(raw)
+        empty = self.stage_input(b"")
+        self.save_manifest({"schemaVersion": 1, "jobId": self.job_id, "kind": "enhanced",
+                            "archiveInputs": [{"name": "update.rpf", "source": baseline}], "payloadInputs": [empty]})
+        archive = {"name": "update.rpf", "path": baseline["path"]}
+        for tool, path in (("add_entry", "new.txt"), ("write_entry", entry)):
+            with self.subTest(tool=tool):
+                result = self.call(tool, archive=archive, entry=path, sourcePath=empty["path"])
+                self.assertEqual(rpf7.read_entry(self.archive_file(result["archive"]), path), b"")
+                page = self.call("read_entry", archive=result["archive"], entry=path)
+                self.assertEqual((page["data"], page["size"], page["sha256"], page["nextOffset"]),
+                                 ("", 0, empty["sha256"], None))
+        self.assertEqual((self.job / baseline["path"]).read_bytes(), raw)
 
     def test_create_nested_archive_reopens_with_binary_and_resources(self):
         vehicle = resource_fixture()
@@ -240,9 +302,13 @@ class ArchiveToolsTests(unittest.TestCase):
         args = {"archive": self.baseline, "entry": self.entry, "sourcePath": self.source["path"]}
         with patch.object(rpf7, "verify_assets", side_effect=rpf7.RpfError(str(self.root))):
             self.reject("write_entry", "verification_failed", **args)
+            self.reject("add_entry", "verification_failed", **{**args, "entry": "data.xml"})
             self.reject("create_archive", "verification_failed", archiveName="new.rpf",
                         entries=[{"entry": "data.xml", "sourcePath": self.source["path"]}])
+        with patch.object(rpf7, "verify_entry_absent", side_effect=rpf7.RpfError(str(self.root))):
+            self.reject("delete_entry", "verification_failed", archive=self.baseline, entry=self.entry)
         self.assertFalse(any(self.job.glob(".work-rpf-*")))
+        self.assertFalse(any(self.job.glob(".work-rpf-artifacts/*")))
         with ThreadPoolExecutor(max_workers=2) as workers:
             results = [workers.submit(self.call, "write_entry", **args) for _ in range(2)]
             first, second = [future.result()["archive"] for future in results]

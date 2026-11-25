@@ -1,7 +1,7 @@
 """Project manifest-backed input references for agents working with a staged job."""
 from pathlib import Path
 
-from .protocol import job_operations, parse_job
+from .protocol import job_operations, parse_job, standalone_inputs
 from .workspace import held_tree, load_input, split_relative
 
 
@@ -9,6 +9,11 @@ def describe_job(jobs: Path, job_id: str, offset: int, limit: int):
     job = jobs / job_id
     with held_tree(job):
         manifest = load_input(job)
+        rows = standalone_inputs(manifest, job_id, split_relative)
+        if rows is not None:
+            end = offset + limit
+            return ({"jobId": job_id, "edition": manifest["kind"], "targets": [], "inputs": rows[offset:end],
+                     "total": len(rows), "nextOffset": end if end < len(rows) else None}, set())
         targets, _, inspection = parse_job(manifest, job_id, split_relative)
 
     # A digest can be reused in several targets and even under different model names.
@@ -42,4 +47,4 @@ def describe_job(jobs: Path, job_id: str, offset: int, limit: int):
     end = offset + limit
     return ({"jobId": job_id, "edition": manifest["kind"], "targets": [t["id"] for t in targets],
              "inputs": rows[offset:end], "total": len(rows), "nextOffset": end if end < len(rows) else None},
-            job_operations(targets, inspection))
+            job_operations(targets, inspection) | {None})

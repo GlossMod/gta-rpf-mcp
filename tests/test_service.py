@@ -331,7 +331,8 @@ class ValidationTests(unittest.TestCase):
             "gta_rpf_prepare", "gta_rpf_status", "gta_rpf_inspect_dlc", "gta_rpf_register_dlc",
             "gta_rpf_replace_gameconfig", "gta_rpf_build_vehicle_pack", "gta_rpf_build_ped_pack",
             "gta_rpf_update_menyoo", "gta_rpf_describe_job", "gta_rpf_list_entries",
-            "gta_rpf_read_entry", "gta_rpf_write_entry", "gta_rpf_create_archive",
+            "gta_rpf_read_entry", "gta_rpf_write_entry", "gta_rpf_add_entry",
+            "gta_rpf_delete_entry", "gta_rpf_create_archive",
         ])
         self.assertTrue(responses[3]["result"]["isError"])
         self.assertIn("error", responses[4])

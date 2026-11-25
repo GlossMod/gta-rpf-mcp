@@ -124,6 +124,79 @@ class Rpf7Tests(unittest.TestCase):
         self.assertEqual(rpf7.list_entries(self.archive), ["dlc.rpf", "dlc.rpf/setup2.xml"])
         self.assertEqual(rpf7.read_entry(self.archive, "dlc.rpf/setup2.xml"), b"<new>" + b"a" * 4096 + b"</new>")
 
+    def test_add_replace_delete_through_two_nested_encrypted_archives(self):
+        leaf = fixture("Inner.rpf", {"keep.xml": (b"Encrypted sibling data", True, True)}, NG)
+        outer = fixture("Outer.rpf", {"Inner.rpf": (leaf, True, True)}, NG)
+        self.archive.write_bytes(fixture(self.archive.name, {
+            "Outer.rpf": (outer, True, True), "keep.bin": (b"Outer sibling data", False, True),
+        }, NG))
+        prefix = "outer.rpf/inner.rpf/"
+        entry = prefix + "Common/Data/DlcList.xml"
+        rpf7.add_entry(self.archive, entry, b"<Paths/>")
+        self.assertEqual(rpf7.read_entry(self.archive, entry.upper()), b"<Paths/>")
+        self.assertIn("Outer.rpf/Inner.rpf/Common/Data/DlcList.xml", rpf7.list_entries(self.archive))
+
+        payload = random.Random(42).randbytes(4096)
+        rpf7.replace_entry(self.archive, entry.replace("/", "\\"), payload)
+        rpf7.verify_assets(self.archive, {entry: expected(payload)})
+        rpf7.delete_entry(self.archive, entry.lower())
+        rpf7.verify_entry_absent(self.archive, entry)
+        with self.assertRaises(rpf7.EntryNotFoundError):
+            rpf7.read_entry(self.archive, entry)
+        self.assertEqual(rpf7.read_entry(self.archive, prefix + "keep.xml"), b"Encrypted sibling data")
+        self.assertEqual(rpf7.read_entry(self.archive, "keep.bin"), b"Outer sibling data")
+        self.assertNotIn("Outer.rpf/Inner.rpf/Common/Data/DlcList.xml", rpf7.list_entries(self.archive))
+        rpf7.add_entry(self.archive, entry, b"<Paths/>")
+        self.assertEqual(rpf7.read_entry(self.archive, entry), b"<Paths/>")
+
+    def test_add_and_replace_empty_standard_files(self):
+        self.archive.write_bytes(fixture(self.archive.name, {}, NG))
+        rpf7.add_entry(self.archive, "empty.txt", b"")
+        rpf7.verify_assets(self.archive, {"empty.txt": expected(b"")})
+        rpf7.replace_entry(self.archive, "empty.txt", b"content")
+        self.assertEqual(rpf7.read_entry(self.archive, "empty.txt"), b"content")
+        rpf7.replace_entry(self.archive, "empty.txt", b"")
+        self.assertEqual(rpf7.read_entry(self.archive, "empty.txt", max_bytes=0), b"")
+        rpf7.delete_entry(self.archive, "empty.txt")
+        self.assertEqual(rpf7.list_entries(self.archive), [])
+        rpf7.verify_entry_absent(self.archive, "empty.txt")
+
+    def test_add_replace_delete_supported_resource_files(self):
+        self.archive.write_bytes(fixture(self.archive.name, {"keep.xml": (b"keep", False, False)}))
+        asset = resource(b"first vehicle")
+        replacement = resource(b"second vehicle", magic=LEGACY_RSC7)
+        rpf7.add_entry(self.archive, "models/car.yft", asset)
+        rpf7.add_entry(self.archive, "models/keep.yft", asset)
+        self.assertEqual(rpf7.read_entry(self.archive, "models/car.yft"), asset)
+        rpf7.replace_entry(self.archive, "models/car.yft", replacement)
+        rpf7.verify_assets(self.archive, {"models/car.yft": expected(replacement), "models/keep.yft": expected(asset)})
+        original = self.archive.read_bytes()
+        with self.assertRaisesRegex(rpf7.RpfError, "Enhanced resource version"):
+            rpf7.replace_entry(self.archive, "models/car.yft", resource(b"unsupported", version=171))
+        self.assertEqual(self.archive.read_bytes(), original)
+        rpf7.delete_entry(self.archive, "models/car.yft")
+        rpf7.verify_entry_absent(self.archive, "models/car.yft")
+        self.assertEqual(rpf7.read_entry(self.archive, "models/keep.yft"), asset)
+        self.assertEqual(rpf7.read_entry(self.archive, "keep.xml"), b"keep")
+
+    def test_failed_add_and_delete_leave_archive_intact(self):
+        leaf = fixture("nested.rpf", {"child.txt": (b"child", False, False)})
+        original = fixture(self.archive.name, {"file.txt": (b"data", False, False),
+                                               "nested.rpf": (leaf, False, False)})
+        self.archive.write_bytes(original)
+        for entry in ("FILE.txt", "file.txt/sub/name.txt", "nested.rpf/CHILD.txt"):
+            with self.subTest(entry=entry), self.assertRaises(rpf7.EntryExistsError):
+                rpf7.add_entry(self.archive, entry, b"new content")
+        with self.assertRaises(rpf7.EntryNotFoundError):
+            rpf7.add_entry(self.archive, "missing.rpf/file.txt", b"new content")
+        with self.assertRaises(rpf7.EntryNotFoundError):
+            rpf7.delete_entry(self.archive, "nested.rpf/missing.txt")
+        with self.assertRaises(rpf7.RpfError):
+            rpf7.delete_entry(self.archive, "nested.rpf")
+        with self.assertRaises(rpf7.RpfError):
+            rpf7.verify_entry_absent(self.archive, "missing.rpf/child.txt")
+        self.assertEqual(self.archive.read_bytes(), original)
+
     def test_large_resource_full_header_and_digest_round_trip_both_magic_variants(self):
         source = self.root / "source"
         source.mkdir()
@@ -195,7 +268,7 @@ class Rpf7Tests(unittest.TestCase):
         with patch.object(Path, "lstat", lstat):
             rpf7.replace_entry(self.archive, "a.xml", b"<new/>")
             mtime_delta = 1_000_000_000
-            with self.assertRaisesRegex(rpf7.RpfError, "changed during replacement"):
+            with self.assertRaisesRegex(rpf7.RpfError, "changed during edit"):
                 rpf7.replace_entry(self.archive, "a.xml", b"<unexpected/>")
         self.assertEqual(rpf7.read_entry(self.archive, "a.xml"), b"<new/>")
 
