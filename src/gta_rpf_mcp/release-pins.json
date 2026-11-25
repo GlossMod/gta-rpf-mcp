@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "projectId": 205014,
+  "resourceId": 356110,
+  "version": "1.4.0",
+  "pins": [
+    {
+      "sha256": "29b32fbb89d8181bd7d9068fd47a7f74ac20c17bfd139e650066914c59ed75cd",
+      "root": "",
+      "evidence": "2026-11-25: anonymous first-party HTTPS resource from official 3DM get-mod-detail(205014), dmod.3dmgame.com/static/upload/resource2/202512/_20251223163607_64342.zip (4696708 bytes). Independent archive retrieval/member inventory and local SHA-256 recomputation; no publisher signature or checksum was published."
+    }
+  ]
+}
