@@ -13,11 +13,11 @@ _PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 _LINE = 1024 * 1024
 _EMPTY = {"type": "object", "properties": {}, "additionalProperties": False}
 _TOOLS = [
-    {"name": "gta_rpf_prepare", "description": "Prepare one manager-created GTA V Legacy archive job; never apply it to a game.",
+    {"name": "gta_rpf_prepare", "description": "Prepare one manager-created GTA V archive job; never apply it to a game.",
      "inputSchema": {**_EMPTY, "properties": {"jobId": {"type": "string", "pattern": "^[0-9a-f]{32}$", "minLength": 32, "maxLength": 32}},
                      "required": ["jobId"]},
      "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False}},
-    {"name": "gta_rpf_status", "description": "Check whether the prescribed local Legacy release and template are verified and available.",
+    {"name": "gta_rpf_status", "description": "Report the bundled Python RPF7 backend and supported jobs for each GTA V edition.",
      "inputSchema": _EMPTY,
      "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}},
 ]
@@ -48,7 +48,7 @@ class Server:
     def tool(self, name, args):
         try:
             if name == "gta_rpf_status" and not args:
-                value = backend_status(workspace_parent())
+                value = backend_status()
             elif name == "gta_rpf_prepare" and args.keys() == {"jobId"}:
                 job_id = token(args["jobId"], JOB_ID, "job ID")
                 value = prepare(workspace_parent(), job_id)
@@ -57,7 +57,7 @@ class Server:
         except Rejected as exc:
             value = {"status": "error", "code": exc.code, "message": str(exc)}
         except (OSError, ValueError, RecursionError):
-            value = {"status": "error", "code": "workspace_io", "message": "The workspace or verified tool could not be used."}
+            value = {"status": "error", "code": "workspace_io", "message": "The workspace or archive could not be used."}
         result = {"content": [{"type": "text", "text": _json(value)}], "isError": value.get("status") == "error"}
         if self.version in _PROTOCOLS[:2]:
             result["structuredContent"] = value

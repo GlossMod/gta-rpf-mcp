@@ -64,6 +64,13 @@ class FakeBridge:
         entries[key] = source.read_text(encoding="utf-8")
         path.write_bytes(fixture_pack(entries))
 
+    def verify_assets(self, archive, expected):
+        entries = fixture_entries(archive)
+        for name, (digest, size) in expected.items():
+            raw = entries[name].encode("utf-8")
+            if (hashlib.sha256(raw).hexdigest(), len(raw)) != (digest, size):
+                raise Rejected("verification_failed", "Fixture model did not survive readback.")
+
     def create_gmm(self):
         entries = {}
         for p in self.template.rglob("*"):
@@ -175,7 +182,8 @@ class JobTests(unittest.TestCase):
             prepare(self.jobs, self.id, FakeBridge)
 
     def test_enhanced_and_unknown_schema_fields_fail_closed(self):
-        self.assertEqual(self.work(edition="enhanced")["code"], "enhanced_unverified")
+        v = {"kind": "vehicle", "files": [self.asset("car.yft")]}
+        self.assertEqual(self.work(target("update", self.baseline(), v), edition="enhanced")["code"], "enhanced_unverified")
         self.new_job("b" * 32)
         self.assertEqual(self.work(toolPath="other.dll")["code"], "invalid_job")
 
@@ -230,7 +238,7 @@ class JobTests(unittest.TestCase):
         shutil.copyfile(self.job / source["path"], victim / "file")
         link = self.job / "jump"
         if os.name == "nt":
-            command = [str(backend._powershell()), "-NoProfile", "-Command",
+            command = [str(Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"), "-NoProfile", "-Command",
                        f"New-Item -ItemType Junction -Path '{link}' -Target '{victim}' | Out-Null"]
             subprocess.run(command, check=True, capture_output=True)
         else:
@@ -254,14 +262,10 @@ class JobTests(unittest.TestCase):
         result = self.work(inspectDlc=self.file("bad", invalid))
         self.assertEqual(result["code"], "unsupported_rpf")
 
-    def test_wrong_package_digest_is_never_executed(self):
-        if os.name != "nt":
-            self.skipTest("Windows only")
-        folder = backend.package_directory(self.jobs)
-        folder.mkdir()
-        (folder / backend.PACKAGE_NAME).write_bytes(b"arbitrary file")
-        self.assertEqual(backend.status(self.jobs)["code"], "unverified_tool")
-        self.assertEqual(self.work(inspectDlc=self.dlc()["source"], factory=backend.WindowsBridge)["code"], "unverified_tool")
+    def test_backend_runs_without_a_tool_directory(self):
+        self.assertEqual(backend.status()["backend"], "python-rpf7")
+        self.assertTrue(backend.status()["ready"])
+        self.assertFalse((self.jobs.parent / "gta-rpf-tools").exists())
 
 
 class ValidationTests(unittest.TestCase):

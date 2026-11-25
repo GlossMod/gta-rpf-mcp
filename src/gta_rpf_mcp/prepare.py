@@ -6,7 +6,9 @@ import os
 import struct
 import tempfile
 
-from .backend import WindowsBridge
+from .backend import ArchiveBackend
+from .rpf7 import RpfError
+from .rpf_crypto import RpfCryptoError
 from .gta_xml import (DLCLIST, GAMECONFIG, PED_META, XML_MAX, add_peds, dlclist, document, inventory,
                       parse_xml, setup_pack, textual_xml, update_menyoo, vehicle_models)
 from .protocol import IDENTIFIER, MAX_FILE_BYTES, OUTPUT_NAMES, Rejected, invalid, parse_job, token
@@ -28,7 +30,7 @@ def check_rpf(path):
         if (magic == 0x52504637 and count > 0 and 16 + count * 16 + names <= size
                 and encryption in {0, 0x4E45504F, 0x0FFFFFF9, 0x0FEFFFFF}):
             return
-    raise Rejected("unsupported_rpf", "Expected a GTA V Legacy RPF7 archive with a complete supported directory table.")
+    raise Rejected("unsupported_rpf", "Expected a GTA V RPF7 archive with a complete supported directory table.")
 
 
 def _identity(ref):
@@ -102,7 +104,7 @@ def models_for(entries):
 class Preparation:
     def __init__(self, work, archive_ops, snapshots):
         self.work = work
-        self.bridge = archive_ops
+        self.archive = archive_ops
         self.snapshot = snapshots
         self.dlcs = {}
         self.edit = work / "edit"
@@ -118,7 +120,7 @@ class Preparation:
             canonical.parent.mkdir(parents=True)
             copy_file(self.source(ref), canonical)
             check_rpf(canonical)
-            name = setup_pack(self.bridge.read(canonical, "setup2.xml"))
+            name = setup_pack(self.archive.read(canonical, "setup2.xml"))
             token(name, IDENTIFIER, "DLC pack name")
             if name == "gmm":
                 raise conflict("The DLC pack name gmm is reserved.")
@@ -163,7 +165,7 @@ class Preparation:
                 configs.append(entry["source"])
         writes = {}
         if packs:
-            old = self.bridge.read(canonical, DLCLIST)
+            old = self.archive.read(canonical, DLCLIST)
             changed = dlclist(old, list(dict.fromkeys(packs)))
             if changed is not None:
                 writes[DLCLIST] = changed
@@ -173,36 +175,38 @@ class Preparation:
             new = read_limited(self.source(configs[0]), XML_MAX)
             parse_xml(new, "replacement gameconfig.xml", "fwAllConfigs")
             # Require the destination to exist/read back in the selected baseline.
-            orig = self.bridge.read(canonical, GAMECONFIG)
+            orig = self.archive.read(canonical, GAMECONFIG)
             parse_xml(orig, "baseline gameconfig.xml", "fwAllConfigs")
             if textual_xml(orig) != textual_xml(new):
                 writes[GAMECONFIG] = new
         for internal, data in writes.items():
             source = self.edit / internal.rsplit("/", 1)[1]
             _write(source, data)
-            self.bridge.write(canonical, internal, source)
+            self.archive.write(canonical, internal, source)
         # Reopen the *finished* archive, after all writes. In particular, check
         # that the latter write did not corrupt/replace the earlier one.
         check_rpf(canonical)
         for internal, data in writes.items():
-            if textual_xml(self.bridge.read(canonical, internal)) != textual_xml(data):
+            if textual_xml(self.archive.read(canonical, internal)) != textual_xml(data):
                 raise Rejected("verification_failed", "The final update.rpf XML readback did not match the intended bytes.")
-        copy_file(canonical, out)
+        canonical.rename(out)
 
     def gmm(self, entries, out):
         vehicles, peds, ped_assets = models_for(entries)
-        template = self.bridge.template  # private, fresh copy extracted from a pinned package
+        template = self.archive.template  # fresh, job-local copy of the packaged manifests
         canonical = self.work / "archives" / "gmm" / "dlc.rpf"
         canonical.parent.mkdir(parents=True)
         setup = read_limited(template / "setup2.xml", XML_MAX)
         if setup_pack(setup) != "gmm":
-            raise Rejected("missing_template", "Unexpected setup2.xml pack identity in the pinned GMM template.")
+            raise Rejected("missing_template", "Unexpected setup2.xml pack identity in the bundled GMM template.")
         content = document(template / "content.xml", "GMM content.xml")
+        expected_assets = {}
         for folder, assets in (("vehicles.rpf", vehicles), ("peds.rpf", ped_assets)):
             root = template / "x64" / folder
             with held_dir(root):
                 for name, f in assets.items():
                     parts = name.split("/")
+                    expected_assets[f"x64/{folder}/{name}"] = _identity(f["source"])
                     dest = root.joinpath(*parts)
                     if not path_absent(dest):
                         raise conflict("A model asset would replace an existing template entry.")
@@ -215,7 +219,7 @@ class Preparation:
         # The stock template mounts Ped metadata even for vehicle-only DLCs.
         # Materialize an empty valid document when the template has no copy.
         if not any((node.text or "").strip().lower().replace("\\", "/").endswith("/data/pedmodelinfo.meta") for node in content.iter()):
-            raise Rejected("missing_template", "The pinned GMM template does not register its Ped metadata.")
+            raise Rejected("missing_template", "The bundled GMM template does not register its Ped metadata.")
         meta_path = template.joinpath(*PED_META.split("/"))
         if path_absent(meta_path):
             prior = parse_xml(b"<CPedModelInfo__InitDataList><InitDatas /></CPedModelInfo__InitDataList>", "Ped defaults")
@@ -240,17 +244,18 @@ class Preparation:
                 # Upstream fills empty directories with a .empty placeholder.
                 # It is not a deployed feature and may be omitted by the writer.
                 extra.add((rel / ".empty").as_posix().lower())
-        self.bridge.create_gmm()
+        self.archive.create_gmm()
         check_rpf(canonical)
-        actual = set(inventory(self.bridge.files(canonical)))
+        actual = set(inventory(self.archive.files(canonical)))
         if not expected <= actual <= expected | extra:
             raise Rejected("verification_failed", "Created GMM DLC does not match the planned archive inventory.")
-        if textual_xml(self.bridge.read(canonical, "setup2.xml")) != textual_xml(setup):
+        self.archive.verify_assets(canonical, expected_assets)
+        if textual_xml(self.archive.read(canonical, "setup2.xml")) != textual_xml(setup):
             raise Rejected("verification_failed", "Created GMM DLC setup2.xml did not survive readback.")
-        if textual_xml(self.bridge.read(canonical, PED_META)) != textual_xml(meta_data):
+        if textual_xml(self.archive.read(canonical, PED_META)) != textual_xml(meta_data):
             raise Rejected("verification_failed", "Created GMM Ped metadata did not match readback.")
         # NG uses the canonical archive name; gmm.rpf is a wire name only.
-        copy_file(canonical, out)
+        canonical.rename(out)
 
     def menyoo(self, baseline, entries, out):
         models = []
@@ -259,7 +264,7 @@ class Preparation:
                 models.extend(vehicle_models(f["name"] for f in entry["files"]))
             else:
                 _, rpf = self.dlc_entry(entry)
-                models.extend(vehicle_models(inventory(self.bridge.files(rpf))))
+                models.extend(vehicle_models(inventory(self.archive.files(rpf))))
         if baseline:
             # Reject oversized XML before the helper loads the snapshot.
             read_limited(self.source(baseline), XML_MAX)
@@ -277,7 +282,7 @@ def _write(path, data):
         os.fsync(out.fileno())
 
 
-def prepare(jobs: Path, job_id: str, backend_factory=WindowsBridge):
+def prepare(jobs: Path, job_id: str, backend_factory=ArchiveBackend):
     from .protocol import JOB_ID
 
     token(job_id, JOB_ID, "job ID")
@@ -306,6 +311,8 @@ def _prepare_locked(job, jobs, job_id, backend_factory):
                 result = _prepare_work(job, jobs, job_id, work, base, backend_factory)
             except Rejected as exc:
                 result = {**base, "status": "error", "code": exc.code, "message": str(exc)}
+            except (RpfError, RpfCryptoError) as exc:
+                result = {**base, "status": "error", "code": "unsupported_rpf", "message": str(exc)}
             except OSError:
                 result = {**base, "status": "error", "code": "workspace_io", "message": "Could not use a job file or stage a result."}
             result_file = work / "result.json"
@@ -331,9 +338,9 @@ def _prepare_work(job, jobs, job_id, work, base, backend_factory):
     try:
         prep = None
         if targets or inspect_dlc is not None:
-            # Menyoo contributions inferred from loose vehicle files need no native code.
-            native = inspect_dlc is not None or any(t["id"] != "menyoo" or any(e["kind"] == "dlc" for e in t["contributions"]) for t in targets)
-            if native:
+            # Loose Menyoo model names can be processed without an archive.
+            needs_archive = inspect_dlc is not None or any(t["id"] != "menyoo" or any(e["kind"] == "dlc" for e in t["contributions"]) for t in targets)
+            if needs_archive:
                 backend = backend_factory(work, jobs, any(t["id"] == "gmm" for t in targets))
             prep = Preparation(work, backend, snapshots)
             prep.validate_targets(targets)

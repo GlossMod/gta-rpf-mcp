@@ -5,11 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "gta-rpf-mcp"
 dynamic = ["version"]
-description = "Prepare isolated Grand Theft Auto V Legacy mod archive jobs for Agent Mod Manager"
+description = "Prepare isolated Grand Theft Auto V mod archive jobs for Agent Mod Manager"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "GPL-3.0-only"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "THIRD-PARTY-NOTICES.txt"]
 classifiers = ["Operating System :: Microsoft :: Windows", "Programming Language :: Python :: 3"]
 dependencies = []
 
@@ -24,4 +24,4 @@ version = {attr = "gta_rpf_mcp.__version__"}
 gta-rpf-mcp = "gta_rpf_mcp.server:main"
 
 [tool.setuptools.package-data]
-gta_rpf_mcp = ["bridge.ps1", "release-pins.json"]
+gta_rpf_mcp = ["template/*.xml", "data/*"]

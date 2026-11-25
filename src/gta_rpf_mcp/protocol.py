@@ -80,9 +80,7 @@ def parse_job(value, job_id: str, parse_path):
     job = record(value, keys | ({"inspectDlc"} if inspection else set()), "job")
     if type(job["schemaVersion"]) is not int or job["schemaVersion"] != 1 or job["jobId"] != job_id:
         raise invalid("Unsupported schema version or mismatched job ID.")
-    if job["kind"] == "enhanced":
-        raise Rejected("enhanced_unverified", "GTA V Enhanced RPF preparation has not been verified.")
-    if job["kind"] != "legacy":
+    if job["kind"] not in ("legacy", "enhanced"):
         raise invalid("Unsupported game edition.")
     if not isinstance(job["targets"], list) or len(job["targets"]) > len(_ALLOWED):
         raise invalid("Invalid target list.")
@@ -116,6 +114,8 @@ def parse_job(value, job_id: str, parse_path):
         name = target["id"]
         if not isinstance(name, str) or name not in _ALLOWED or name in seen:
             raise invalid("Unsupported or duplicate target ID.")
+        if job["kind"] == "enhanced" and name != "update":
+            raise Rejected("enhanced_unverified", "Enhanced supports gameconfig and DLC registration only.")
         seen.add(name)
         baseline = None if target["baseline"] is None else ref(target["baseline"])
         if (name == "update" and baseline is None) or (name == "gmm" and baseline is not None):
@@ -130,6 +130,8 @@ def parse_job(value, job_id: str, parse_path):
             kind = entry.get("kind") if isinstance(entry, dict) else None
             if not isinstance(kind, str) or kind not in _ALLOWED[name]:
                 raise invalid(f"Unsupported contribution for {name}.")
+            if job["kind"] == "enhanced" and kind not in {"dlc", "gameconfig"}:
+                raise Rejected("enhanced_unverified", "Enhanced loose model preparation is unverified.")
             if kind in {"dlc", "gameconfig"}:
                 keys = {"kind", "source"} | ({"packName"} if kind == "dlc" else set())
                 entry = {**record(entry, keys, "contribution"), "source": ref(entry["source"])}

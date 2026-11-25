@@ -1,0 +1,53 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<CDataFileMgr__ContentsOfDataFileXml>
+    <disabledFiles />
+    <includedXmlFiles />
+    <includedDataFiles />
+    <dataFiles>
+        <Item>
+            <filename>dlc_gmm:/%PLATFORM%/vehicles.rpf</filename>
+            <fileType>RPF_FILE</fileType>
+            <overlay value="true" />
+            <disabled value="true" />
+            <persistent value="true" />
+        </Item>
+        <Item>
+            <filename>dlc_gmm:/%PLATFORM%/gmm_mods.rpf</filename>
+            <fileType>RPF_FILE</fileType>
+            <overlay value="true" />
+            <disabled value="true" />
+            <persistent value="true" />
+        </Item>
+        <Item>
+            <filename>dlc_gmm:/%PLATFORM%/peds.rpf</filename>
+            <fileType>PEDSTREAM_FILE</fileType>
+            <overlay value="false" />
+            <disabled value="true" />
+            <persistent value="true" />
+        </Item>
+        <Item>
+            <filename>dlc_gmm:/data/pedmodelinfo.meta</filename>
+            <fileType>PED_METADATA_FILE</fileType>
+            <overlay value="false" />
+            <disabled value="true" />
+            <persistent value="true" />
+        </Item>
+    </dataFiles>
+    <contentChangeSets>
+        <Item>
+            <changeSetName>gmm_AUTOGEN</changeSetName>
+            <filesToDisable />
+            <filesToEnable>
+                <Item>dlc_gmm:/%PLATFORM%/vehicles.rpf</Item>
+                <Item>dlc_gmm:/%PLATFORM%/gmm_mods.rpf</Item>
+                <Item>dlc_gmm:/%PLATFORM%/peds.rpf</Item>
+                <Item>dlc_gmm:/data/pedmodelinfo.meta</Item>
+            </filesToEnable>
+            <txdToLoad />
+            <txdToUnload />
+            <residentResources />
+            <unregisterResources />
+        </Item>
+    </contentChangeSets>
+    <patchFiles />
+</CDataFileMgr__ContentsOfDataFileXml>
